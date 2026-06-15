@@ -14,6 +14,7 @@
 static_assert(sizeof(Particle) == 24,
               "Particle layout must match Metal shader");
 
+
 static const char *SHADER_PATH = "src/shaders.metal";
 
 static NSString *load_shader_source() {
@@ -23,9 +24,7 @@ static NSString *load_shader_source() {
     NSString *src = [NSString stringWithContentsOfFile:path
                                               encoding:NSUTF8StringEncoding
                                                  error:&err];
-    if (!src) {
-        fprintf(stderr, "Could not read %s: %s\n", [path UTF8String],
-                [[err localizedDescription] UTF8String]);
+    if (!src) { fprintf(stderr, "Could not read %s: %s\n", [path UTF8String], [[err localizedDescription] UTF8String]);
     }
     return src;
 }
@@ -55,9 +54,9 @@ struct MetalSim {
 
     uint32_t count;
     uint32_t numTypes;
-    uint32_t gridDim;    // Dinámico
-    uint32_t gridNCells; // Dinámico
-    int srad;            // Dinámico
+    uint32_t gridDim;
+    uint32_t gridNCells;
+    int srad;
     uint32_t tgsz;
     dispatch_semaphore_t frameSema;
 };
@@ -80,7 +79,7 @@ make_pipeline(id<MTLDevice> dev, id<MTLLibrary> lib, const char *name) {
 }
 
 MetalSim *metal_sim_create(Particle *initial, uint32_t count,
-                           uint32_t num_types, uint32_t grid_dim, int srad) {
+                           uint32_t num_types, uint32_t grid_dim, int srad, float rforce) {
     MetalSim *sim = new MetalSim();
     sim->count = count;
     sim->numTypes = num_types;
@@ -102,12 +101,12 @@ MetalSim *metal_sim_create(Particle *initial, uint32_t count,
     if (!shaderSrc)
         return nullptr;
 
-    // Configurar opciones de compilación en caliente para inyectar macros
     MTLCompileOptions *options = [MTLCompileOptions new];
     options.preprocessorMacros = @{
         @"GDIM" : @(grid_dim),
         @"SRAD" : @(srad),
-        @"MAX_TYPES" : @(num_types)
+        @"MAX_TYPES" : @(num_types),
+        @"REPEL_FORCE" : @(rforce)
     };
 
     NSError *err = nil;
@@ -125,7 +124,6 @@ MetalSim *metal_sim_create(Particle *initial, uint32_t count,
     sim->scatterPipeline =
         make_pipeline(sim->device, sim->lib, "scatter_particles");
     sim->gridForcePipeline = make_pipeline(sim->device, sim->lib, "grid_force");
-
     if (!sim->clearPipeline || !sim->countPipeline || !sim->scatterPipeline ||
         !sim->gridForcePipeline)
         return nullptr;
@@ -166,10 +164,10 @@ MetalSim *metal_sim_create(Particle *initial, uint32_t count,
     for (uint32_t i = 0; i < num_types * 4; i++)
         c[i] = 1.0f;
 
-    printf("Metal listo — %s | tgsz %u | %u partículas | %u tipos | grid %ux%u "
-           "(rad %d)\n",
-           [sim->device.name UTF8String], sim->tgsz, count, num_types,
-           sim->gridDim, sim->gridDim, sim->srad);
+    printf(
+        "Metal ready — %s | tgsz %u | %u particles | %u types | grid %ux%u (rad %d)\n",
+        [sim->device.name UTF8String], sim->tgsz, count, num_types,
+        sim->gridDim, sim->gridDim, sim->srad);
     return sim;
 }
 
@@ -187,17 +185,17 @@ void metal_render_init(MetalSim *sim, GLFWwindow *glfwWin, int fbw, int fbh) {
     view.wantsLayer = YES;
     view.layer = sim->metalLayer;
 
-    MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
-    rpd.vertexFunction = [sim->lib newFunctionWithName:@"particle_vert"];
-    rpd.fragmentFunction = [sim->lib newFunctionWithName:@"particle_frag"];
-    rpd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    rpd.colorAttachments[0].blendingEnabled = YES;
-    rpd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    rpd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
-    rpd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    rpd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
-
     NSError *err = nil;
+
+    MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+    rpd.vertexFunction   = [sim->lib newFunctionWithName:@"particle_vert"];
+    rpd.fragmentFunction = [sim->lib newFunctionWithName:@"particle_frag"];
+    rpd.colorAttachments[0].pixelFormat              = MTLPixelFormatBGRA8Unorm;
+    rpd.colorAttachments[0].blendingEnabled          = YES;
+    rpd.colorAttachments[0].sourceRGBBlendFactor     = MTLBlendFactorSourceAlpha;
+    rpd.colorAttachments[0].destinationRGBBlendFactor= MTLBlendFactorOne;
+    rpd.colorAttachments[0].sourceAlphaBlendFactor   = MTLBlendFactorOne;
+    rpd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
     sim->renderPipeline =
         [sim->device newRenderPipelineStateWithDescriptor:rpd error:&err];
     if (!sim->renderPipeline)
@@ -214,10 +212,8 @@ void metal_step_and_render(MetalSim *sim, float dt, float G, float softening2,
         uint32_t N, num_types;
         float inv_cell, dt, G, softening2, drag;
     };
-
-    GridParams gp = {
-        sim->count, sim->numTypes, (float)sim->gridDim / 2.0f, dt, G,
-        softening2, drag};
+    GridParams gp = {sim->count, sim->numTypes, (float)sim->gridDim / 2.0f, dt,
+                     G, softening2, drag};
 
     uint32_t pGroups = (sim->count + sim->tgsz - 1) / sim->tgsz;
     uint32_t cGroups = (sim->gridNCells + sim->tgsz - 1) / sim->tgsz;
@@ -298,10 +294,9 @@ void metal_step_and_render(MetalSim *sim, float dt, float G, float softening2,
     {
         MTLRenderPassDescriptor *rpd =
             [MTLRenderPassDescriptor renderPassDescriptor];
-        rpd.colorAttachments[0].texture = drawable.texture;
-        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rpd.colorAttachments[0].clearColor =
-            MTLClearColorMake(0.02, 0.02, 0.06, 1.0);
+        rpd.colorAttachments[0].texture     = drawable.texture;
+        rpd.colorAttachments[0].loadAction  = MTLLoadActionClear;
+        rpd.colorAttachments[0].clearColor  = MTLClearColorMake(0.02, 0.02, 0.06, 1.0);
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
 
         id<MTLRenderCommandEncoder> re =
@@ -322,6 +317,11 @@ void metal_step_and_render(MetalSim *sim, float dt, float G, float softening2,
     }];
     [cb presentDrawable:drawable];
     [cb commit];
+}
+
+void metal_resize(MetalSim *sim, int fbw, int fbh) {
+    if (sim->metalLayer)
+        sim->metalLayer.drawableSize = CGSizeMake(fbw, fbh);
 }
 
 float *metal_sim_matrix(MetalSim *sim) {

@@ -9,15 +9,16 @@ struct Particle {
 };
 
 struct Camera {
-    float ox = 0.0f, oy = 0.0f, zoom = 1.0f;
+    float ox = 0.0f, oy = 0.0f, zoom = 1.0f, aspect = 1.0f;
 };
 
 struct MetalSim;
 struct GLFWwindow;
 
 MetalSim *metal_sim_create(Particle *initial, uint32_t count,
-                           uint32_t num_types, uint32_t grid_dim, int srad);
+                           uint32_t num_types, uint32_t grid_dim, int srad, float rforce);
 void metal_render_init(MetalSim *sim, GLFWwindow *glfwWin, int fbw, int fbh);
+void metal_resize(MetalSim *sim, int fbw, int fbh);
 void metal_step_and_render(MetalSim *sim, float dt, float G, float softening2,
                            float drag, Camera cam);
 float *metal_sim_matrix(MetalSim *sim);

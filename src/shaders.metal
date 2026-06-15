@@ -1,8 +1,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct Particle {
+    float2 pos;
+    float2 vel;
+    float mass;
+    float type;
+};
+
 #ifndef GDIM
-#define GDIM 256
+#define GDIM 512
 #endif
 
 #ifndef SRAD
@@ -10,15 +17,12 @@ using namespace metal;
 #endif
 
 #ifndef MAX_TYPES
-#define MAX_TYPES 8
+#define MAX_TYPES 16
 #endif
 
-struct Particle {
-    float2 pos;
-    float2 vel;
-    float mass;
-    float type;
-};
+#ifndef REPEL_FORCE
+#define REPEL_FORCE 1.0f
+#endif
 
 struct GridParams {
     uint N;
@@ -47,7 +51,7 @@ kernel void count_cells(device const Particle *src [[buffer(0)]],
         return;
     int cx = to_cell(src[id].pos.x, gp.inv_cell);
     int cy = to_cell(src[id].pos.y, gp.inv_cell);
-    atomic_fetch_add_explicit(&counts[cy * GDIM + cx], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&counts[(uint)cy * GDIM + (uint)cx], 1, memory_order_relaxed);
 }
 
 kernel void scatter_particles(device const Particle *src [[buffer(0)]],
@@ -59,7 +63,7 @@ kernel void scatter_particles(device const Particle *src [[buffer(0)]],
         return;
     int cx = to_cell(src[id].pos.x, gp.inv_cell);
     int cy = to_cell(src[id].pos.y, gp.inv_cell);
-    uint slot = atomic_fetch_add_explicit(&cell_write[cy * GDIM + cx], 1,
+    uint slot = atomic_fetch_add_explicit(&cell_write[(uint)cy * GDIM + (uint)cx], 1,
                                           memory_order_relaxed);
     sorted[slot] = src[id];
 }
@@ -76,34 +80,16 @@ kernel void grid_force(device const Particle *sorted [[buffer(0)]],
     if (id >= gp.N)
         return;
 
-
     const Particle self = sorted[id];
     const float2 pos = self.pos;
     const int myType = (int)self.type;
 
-
-
-
-    float local_g_matrix[MAX_TYPES];
-    float local_min_rad_sq[MAX_TYPES];
-    float local_max_rad_sq[MAX_TYPES];
-
-    const uint type_limit = min(gp.num_types, (uint)MAX_TYPES);
-    for (uint t = 0; t < type_limit; t++) {
-        uint pair = myType * gp.num_types + t;
-        local_g_matrix[t] = matrix[pair] * gp.G;
-
-        float r_min = min_rad[pair];
-        float r_max = max_rad[pair];
-        local_min_rad_sq[t] = r_min * r_min;
-        local_max_rad_sq[t] = r_max * r_max;
-    }
+    const uint base = (uint)myType * gp.num_types;
 
     const int cx = to_cell(pos.x, gp.inv_cell);
     const int cy = to_cell(pos.y, gp.inv_cell);
 
     float2 accel = float2(0.0f);
-
 
     for (int dy = -SRAD; dy <= SRAD; dy++) {
         int ny = cy + dy;
@@ -114,45 +100,50 @@ kernel void grid_force(device const Particle *sorted [[buffer(0)]],
             if (nx < 0 || nx >= (int)GDIM)
                 continue;
 
-            uint cell = ny * GDIM + nx;
+            uint cell = (uint)ny * GDIM + (uint)nx;
             uint start = starts[cell];
-            uint cnt = counts[cell];
+            uint end = start + counts[cell];
 
-            for (uint k = 0; k < cnt; k++) {
-
-                const Particle other = sorted[start + k];
-                const int nType = (int)other.type;
-
-                if (nType >= (int)type_limit)
+            for (uint k = start; k < end; k++) {
+                if (k == id)
                     continue;
-
-                float2 d = other.pos - pos;
+                int nType = (int)sorted[k].type;
+                float2 d = sorted[k].pos - pos;
                 float dist2 = dot(d, d);
 
+                uint pair = base + (uint)nType;
+                float mn = min_rad[pair];
 
-                if (dist2 < local_min_rad_sq[nType] || dist2 > local_max_rad_sq[nType])
+                float mx = max_rad[pair];
+
+                if (dist2 > mx * mx)
                     continue;
-
 
                 float r2 = dist2 + gp.softening2;
                 float inv_r = rsqrt(r2);
-                float inv3 = inv_r * inv_r * inv_r;
-
-
-                accel += d * (other.mass * inv3 * local_g_matrix[nType]);
+                float dist = r2 * inv_r;
+                if (dist < mn) {
+                    float force = dist / mn - 1.0f;
+                    accel += d * (force * REPEL_FORCE * inv_r);
+                } else {
+                    float inv3 = inv_r * inv_r * inv_r;
+                    accel += d * (gp.G * sorted[k].mass * matrix[pair] * inv3);
+                }
             }
         }
     }
 
-
-    output[id].vel = (self.vel + accel * gp.dt) * gp.drag;
-    output[id].pos = self.pos + output[id].vel * gp.dt;
+    float2 vel = fma(accel,gp.dt,self.vel) * gp.drag;
+    output[id].pos = fma(vel,gp.dt,self.pos);
+    output[id].vel = vel;
     output[id].mass = self.mass;
     output[id].type = self.type;
 }
 
+// ── Render ────────────────────────────────────────────────────────────────────
+
 struct Camera {
-    float ox, oy, zoom;
+    float ox, oy, zoom, aspect;
 };
 
 struct VertOut {
@@ -167,19 +158,27 @@ vertex VertOut particle_vert(device const Particle *particles [[buffer(0)]],
                              uint vid [[vertex_id]]) {
     float2 world = particles[vid].pos;
     float2 view = (world - float2(cam.ox, cam.oy)) * cam.zoom;
+    view.x /= cam.aspect;
     VertOut o;
     o.position = float4(view, 0.0, 1.0);
-    o.point_size = clamp(2.0 * cam.zoom, 1.0, 16.0);
+    o.point_size = cam.zoom * 4.0;
     o.color = colors[(int)particles[vid].type].rgb;
     return o;
 }
 
 fragment float4 particle_frag(VertOut in [[stage_in]],
                               float2 coord [[point_coord]]) {
-    float2 c = coord - 0.5;
-    float d = dot(c, c) * 4.0;
-    if (d > 1.0)
+    float2 c = coord - 0.5f;
+    float r = length(c) * 2.0f;
+
+    if (r > 1.0f)
         discard_fragment();
-    float alpha = 0.8 * (1.0 - d);
-    return float4(in.color * alpha, alpha);
+
+    float core = 1.0f - smoothstep(0.0f, 0.35f, r);
+    float glow = 1.0f - smoothstep(0.15f, 1.0f, r);
+
+    float alpha = max(core * 4.0f, glow * 0.05f);
+
+    return float4(in.color, alpha);
 }
+

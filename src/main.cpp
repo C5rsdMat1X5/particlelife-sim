@@ -7,20 +7,18 @@
 #include <cstdlib>
 #include <vector>
 
-
-static const uint32_t GRID_DIM = 256;
-static const int SEARCH_RAD = 8;
-
-static const uint32_t N = 1 << 16;
+static const uint32_t N = 1 << 17;
 static const uint32_t NUM_TYPES = 16;
 static const float G = 5e-7f;
+static const float REPEL_FORCE = 0.05f;
 static const float SOFTENING2 = 1e-5f;
 static const float DRAG = 0.95f;
 static const int WINDOW_W = 900;
 static const int WINDOW_H = 900;
+static const float SMOOTH = 14.0f;
 static const float RAND_SCALE = 4.0f;
-
-
+static const uint32_t GRID_DIM = 512;
+static const int SEARCH_RAD = 8;
 static const float MAX_SEARCH = (float)SEARCH_RAD * (2.0f / (float)GRID_DIM);
 
 static void hsv_to_rgb(float h, float s, float v, float &r, float &g,
@@ -65,7 +63,8 @@ static void hsv_to_rgb(float h, float s, float v, float &r, float &g,
 }
 
 struct InputState {
-    Camera cam;
+    Camera cam_target;
+    Camera cam_render;
     bool panning = false;
     double last_x = 0.0, last_y = 0.0;
     int fb_w = WINDOW_W, fb_h = WINDOW_H;
@@ -84,12 +83,13 @@ static void scroll_cb(GLFWwindow *win, double, double dy) {
     glfwGetCursorPos(win, &cx, &cy);
     float nx, ny;
     screen_to_ndc(*s, cx, cy, nx, ny);
-    float wx = nx / s->cam.zoom + s->cam.ox;
-    float wy = ny / s->cam.zoom + s->cam.oy;
-    s->cam.zoom *= (dy > 0) ? 1.12f : (1.0f / 1.12f);
-    s->cam.zoom = std::clamp(s->cam.zoom, 0.05f, 200.0f);
-    s->cam.ox = wx - nx / s->cam.zoom;
-    s->cam.oy = wy - ny / s->cam.zoom;
+    float a = s->cam_target.aspect;
+    float wx = nx * a / s->cam_target.zoom + s->cam_target.ox;
+    float wy = ny / s->cam_target.zoom + s->cam_target.oy;
+    s->cam_target.zoom *= (dy > 0) ? 1.12f : (1.0f / 1.12f);
+    s->cam_target.zoom = std::clamp(s->cam_target.zoom, 0.05f, 200.0f);
+    s->cam_target.ox = wx - nx * a / s->cam_target.zoom;
+    s->cam_target.oy = wy - ny / s->cam_target.zoom;
 }
 
 static void mouse_btn_cb(GLFWwindow *win, int btn, int action, int) {
@@ -104,22 +104,22 @@ static void cursor_cb(GLFWwindow *win, double x, double y) {
     auto *s = (InputState *)glfwGetWindowUserPointer(win);
     if (!s->panning)
         return;
-    float dx = (float)(x - s->last_x) / s->fb_w * 2.0f / s->cam.zoom;
-    float dy = -(float)(y - s->last_y) / s->fb_h * 2.0f / s->cam.zoom;
-    s->cam.ox -= dx;
-    s->cam.oy -= dy;
+    float dx = (float)(x - s->last_x) / s->fb_w * 2.0f * s->cam_target.aspect / s->cam_target.zoom;
+    float dy = -(float)(y - s->last_y) / s->fb_h * 2.0f / s->cam_target.zoom;
+    s->cam_target.ox -= dx;
+    s->cam_target.oy -= dy;
     s->last_x = x;
     s->last_y = y;
 }
 
 static void print_matrix(const char *label, const float *mat, uint32_t n) {
     printf("\n%s (%u×%u)\n", label, n, n);
-    printf("      ");
+    printf(" ");
     for (uint32_t j = 0; j < n; j++)
         printf(" T%-6u", j);
     printf("\n");
     for (uint32_t i = 0; i < n; i++) {
-        printf("  T%u  ", i);
+        printf(" T%u ", i);
         for (uint32_t j = 0; j < n; j++)
             printf(" %+.4f", mat[i * n + j]);
         printf("\n");
@@ -145,9 +145,8 @@ int main() {
                         (float)(rand() % NUM_TYPES)};
     }
 
-
     MetalSim *sim =
-        metal_sim_create(particles.data(), N, NUM_TYPES, GRID_DIM, SEARCH_RAD);
+        metal_sim_create(particles.data(), N, NUM_TYPES, GRID_DIM, SEARCH_RAD, REPEL_FORCE);
     if (!sim)
         return 1;
 
@@ -192,6 +191,8 @@ int main() {
 
     InputState input;
     glfwGetFramebufferSize(win, &input.fb_w, &input.fb_h);
+    input.cam_target.aspect = (float)input.fb_w / (float)input.fb_h;
+    input.cam_render.aspect = input.cam_target.aspect;
     glfwSetWindowUserPointer(win, &input);
     glfwSetScrollCallback(win, scroll_cb);
     glfwSetMouseButtonCallback(win, mouse_btn_cb);
@@ -209,8 +210,11 @@ int main() {
 
         if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(win, GLFW_TRUE);
-        if (glfwGetKey(win, GLFW_KEY_R) == GLFW_PRESS)
-            input.cam = Camera{};
+        if (glfwGetKey(win, GLFW_KEY_R) == GLFW_PRESS) {
+            float asp = input.cam_target.aspect;
+            input.cam_target = Camera{};  input.cam_target.aspect = asp;
+            input.cam_render = Camera{};  input.cam_render.aspect = asp;
+        }
         if (glfwGetKey(win, GLFW_KEY_0) == GLFW_PRESS)
             input.dt_scale = 1.0f;
         if (glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS)
@@ -220,18 +224,40 @@ int main() {
             input.dt_scale = std::max(
                 input.dt_scale / (float)std::pow(2.0, raw_dt * 2.0), 0.0f);
 
+        {
+            int fw, fh;
+            glfwGetFramebufferSize(win, &fw, &fh);
+            if (fw != input.fb_w || fh != input.fb_h) {
+                input.fb_w = fw;
+                input.fb_h = fh;
+                float asp = (float)fw / (float)fh;
+                input.cam_target.aspect = asp;
+                input.cam_render.aspect = asp;
+                metal_resize(sim, fw, fh);
+            }
+        }
+
+        {
+            float a = 1.0f - expf(-SMOOTH * (float)raw_dt);
+            input.cam_render.ox += a * (input.cam_target.ox - input.cam_render.ox);
+            input.cam_render.oy += a * (input.cam_target.oy - input.cam_render.oy);
+            float lz = logf(input.cam_render.zoom);
+            float lt = logf(input.cam_target.zoom);
+            input.cam_render.zoom = expf(lz + a * (lt - lz));
+        }
+
         double dt_real = raw_dt * (double)input.dt_scale;
         metal_step_and_render(sim, (float)dt_real, G, SOFTENING2, DRAG,
-                              input.cam);
+                              input.cam_render);
         glfwPollEvents();
 
-        if (++frame % 2 == 0) {
-            char title[128];
-            snprintf(title, sizeof(title),
-                     "N-Body  %uK particles  %u types  %.0f FPS  %ux%u grid  "
-                     "%.2f dt  %.2f zoom",
-                     N / 1000, NUM_TYPES, raw_dt > 0 ? 1.0 / raw_dt : 0.0,
-                     GRID_DIM, GRID_DIM, input.dt_scale, (double)input.cam.zoom);
+        if (++frame % 10 == 0) {
+            char title[96];
+            snprintf(
+                title, sizeof(title),
+                "N-Body  %uK particles  %u types  %.0f FPS  zoom %.2f  DT %.2f",
+                N / 1000, NUM_TYPES, raw_dt > 0 ? 1.0 / raw_dt : 0.0,
+                (double)input.cam_target.zoom, (double)input.dt_scale);
             glfwSetWindowTitle(win, title);
         }
     }
