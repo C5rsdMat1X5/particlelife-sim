@@ -1,4 +1,4 @@
-# Gravity Sim
+# Particle Life Sim
 
 A real-time particle life simulation running entirely on the GPU via Apple Metal. 131 072 particles self-organize into emergent structures driven by per-type attraction/repulsion rules generated at random each run.
 
